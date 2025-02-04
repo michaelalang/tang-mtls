@@ -1,0 +1,21 @@
+[PKI client]
+client = yes
+accept = 127.0.0.2:443
+connect = {{ ansible_default_ipv4.address }}:443
+sni = protected.tang.example.com
+verifyChain = yes
+CAfile = /etc/mtls/ca.crt
+cert = /etc/mtls/certificates/{{ client }}.crt
+key = /etc/mtls/private/{{ client }}.key
+checkHost = protected.tang.example.com
+
+[PKI client]
+client = yes
+accept = 127.0.0.1:443
+sni = tang.example.com
+connect = {{ ansible_default_ipv4.address }}:443
+verifyChain = yes
+CAfile = /etc/mtls/ca.crt
+cert = /etc/mtls/certificates/{{ client }}.crt
+key = /etc/mtls/private/{{ client }}.key
+checkHost = tang.example.com

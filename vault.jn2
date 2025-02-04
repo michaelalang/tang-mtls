@@ -1,0 +1,3 @@
+#!/bin/bash
+
+echo "{{ random_passphrase }}"

@@ -1,0 +1,398 @@
+---
+- name: Setup a Secure TANG service
+  hosts: tangserver
+  gather_facts: true
+  become: true
+  vars:
+    VAULT_ADDR: ""
+    VAULT_TOKEN: ""
+    tangserver: "localhost"
+    tangport: 443
+    tangsocket: "127.0.0.2:8080"
+
+  tasks:
+    - name: password handling
+      block:
+      - name: fetch Vault password for CA
+        vars:
+          token: "{{ lookup('ansible.builtin.env', 'VAULT_TOKEN') |
+                    default ( lookup('ansible.builtin.vars', 'VAULT_TOKEN'), True) }}"
+          vault_addr: "{{ lookup('ansible.builtin.env', 'VAULT_ADDR') |
+                    default ( lookup('ansible.builtin.vars', 'VAULT_ADDR'), True) }}"
+          password: "{{ lookup('community.hashi_vault.hashi_vault',
+                          'secret=kv/data/tang/mtls/ca:password
+                          token={{ token }}
+                          url={{ vault_addr }}') }}"
+        ansible.builtin.set_fact:
+          secret_ca_passphrase: "{{ password }}"
+        delegate_to: localhost
+        tags:
+          - always
+
+      rescue:
+      - name: generate random password for CA
+        ansible.builtin.set_fact:
+          secret_ca_passphrase: "{{ lookup('ansible.builtin.password', '/dev/null', length=16) }}"
+        tags:
+          - always
+
+      - name: save CA password to Vault
+        vars:
+          token: "{{ lookup('ansible.builtin.env', 'VAULT_TOKEN') |
+                    default ( lookup('ansible.builtin.vars', 'VAULT_TOKEN'), True) }}"
+          vault_addr: "{{ lookup('ansible.builtin.env', 'VAULT_ADDR') |
+                    default ( lookup('ansible.builtin.vars', 'VAULT_ADDR'), True) }}"
+        community.hashi_vault.vault_kv2_write:
+          url: "{{ vault_addr }}"
+          token: "{{ token }}"
+          engine_mount_point: "kv"
+          path: "/tang/mtls/ca"
+          data:
+            password: "{{ secret_ca_passphrase }}"
+        ignore_errors: yes
+        delegate_to: localhost
+        tags:
+          - always
+
+    - name: install httpd 
+      vars:
+        packages:
+          - httpd
+          - mod_ssl
+          - tang
+          - clevis
+          - stunnel
+          - python3-cryptography
+      ansible.builtin.dnf:
+        name: "{{ packages }}"
+        state: latest
+      tags:
+        - setup
+
+    - name: create mTLS CA directory
+      ansible.builtin.file:
+        path: "/etc/{{ item }}"
+        state: directory
+        owner: root
+        group: root
+      with_items:
+        - mtls
+        - mtls/private
+        - mtls/certificates
+        - systemd/system/tangd.socket.d
+      tags:
+        - setup
+
+    - name: configure http for mTLS 
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dst }}"
+      with_items:
+        - src: httpd.conf.jn2
+          dst: /etc/httpd/conf/httpd.conf
+        - src: ssl.conf.jn2
+          dst: /etc/httpd/conf.d/ssl.conf
+        - src: port.conf.jn2
+          dst: /etc/systemd/system/tangd.socket.d/port.conf
+      tags:
+        - setup
+
+    - name: change tangd socket port selabel
+      ansible.builtin.seport:
+        ports: 8080
+        proto: tcp
+        setype: tangd_port_t
+        state: present
+      tags:
+        - setup
+
+    - name: Set httpd_can_network_connect flag for tang proxy
+      ansible.posix.seboolean:
+        name: httpd_can_network_connect
+        state: true
+        persistent: true
+      tags:
+        - setup
+
+    - name: Generate an OpenSSL private key with the default values (4096 bits, RSA)
+      community.crypto.openssl_privatekey:
+        path: /etc/mtls/private/ca.key
+        passphrase: "{{ secret_ca_passphrase }}"
+        cipher: auto
+      tags:
+        - setup
+
+    - name: Create certificate signing request (CSR) for CA certificate
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: /etc/mtls/private/ca.key
+        privatekey_passphrase: "{{ secret_ca_passphrase }}"
+        common_name: TANG mTLS Root CA
+        use_common_name_for_san: false  
+        basic_constraints:
+          - 'CA:TRUE'
+        basic_constraints_critical: true
+        key_usage:
+          - keyCertSign
+        key_usage_critical: true
+      register: ca_csr
+      tags:
+        - setup
+
+    - name: adding the TANG CA to the system trust-bundle 
+      ansible.builtin.file:
+        src: /etc/mtls/ca.crt
+        dest: /etc/pki/ca-trust/source/anchors/tang-ca.crt
+        state: link
+      notify: Update ca-trust-bundle
+
+    - name: Create self-signed CA certificate from CSR
+      community.crypto.x509_certificate:
+        path: /etc/mtls/ca.crt
+        csr_content: "{{ ca_csr.csr }}"
+        privatekey_path: /etc/mtls/private/ca.key
+        privatekey_passphrase: "{{ secret_ca_passphrase }}"
+        provider: selfsigned
+      tags:
+        - setup
+
+    - name: password handling for tangd key
+      block:
+      - name: fetch Vault password for TANG service
+        vars:
+          token: "{{ lookup('ansible.builtin.env', 'VAULT_TOKEN') |
+                    default ( lookup('ansible.builtin.vars', 'VAULT_TOKEN'), True) }}"
+          vault_addr: "{{ lookup('ansible.builtin.env', 'VAULT_ADDR') |
+                    default ( lookup('ansible.builtin.vars', 'VAULT_ADDR'), True) }}"
+          password: "{{ lookup('community.hashi_vault.hashi_vault',
+                          'secret=kv/data/tang/mtls/tang:password
+                          token={{ token }}
+                          url={{ vault_addr }}') }}"
+        ansible.builtin.set_fact:
+          random_passphrase: "{{ password }}"
+        delegate_to: localhost
+        tags:
+          - never  # enable me if you want a protected Service SSL
+
+      rescue:
+      - name: generate random password for TANG service
+        ansible.builtin.set_fact:
+          random_passphrase: "{{ lookup('ansible.builtin.password', '/tmp/webservice', length=16) }}"
+        tags:
+          - never  # enable me if you want a protected Service SSL
+
+      - name: save tang key password to Vault
+        vars:
+          token: "{{ lookup('ansible.builtin.env', 'VAULT_TOKEN') |
+                    default ( lookup('ansible.builtin.vars', 'VAULT_TOKEN'), True) }}"
+          vault_addr: "{{ lookup('ansible.builtin.env', 'VAULT_ADDR') |
+                    default ( lookup('ansible.builtin.vars', 'VAULT_ADDR'), True) }}"
+        community.hashi_vault.vault_kv2_write:
+          url: "{{ vault_addr }}"
+          token: "{{ token }}"
+          engine_mount_point: "kv"
+          path: "/tang/mtls/tang"
+          data:
+            password: "{{ random_passphrase }}"
+        delegate_to: localhost
+        tags:
+          - never # enable me if you want a protected Service SSL
+
+    # the vault shell here is used to fetch the SSL key passphrase from an external system like Vault
+    - name: create vault for decrypting tang in httpd
+      ansible.builtin.template:
+        src: "./vault.jn2"
+        dest: "/usr/local/bin/vault"
+      tags:
+        - always
+
+    - name: ensure vault executeable
+      ansible.builtin.file:
+        path: "/usr/local/bin/vault"
+        mode: '0755'
+        owner: root
+        group: root
+      tags:
+        - always  
+
+    - name: ensure https protected directory exists
+      ansible.builtin.file:
+        path: "/var/www/html/protected"
+        mode: '0755'
+        owner: root
+        group: root
+        state: directory
+        setype: httpd_sys_content_t
+      tags:
+        - always
+
+    - name: Create private key for mTLS client
+      community.crypto.openssl_privatekey:
+        path: "/etc/mtls/private/tang.key"
+        #passphrase: "{{ random_passphrase }}"  # enable me if you want a protected Service SSL
+        passphrase: Null
+        cipher: auto
+      tags:
+        - setup
+
+    - name: Create certificate signing request (CSR) for webservice
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: /etc/mtls/private/tang.key
+        #privatekey_passphrase: "{{ random_passphrase }}"  # enable me if you want a protected Service SSL
+        common_name: TANG mTLS service
+        use_common_name_for_san: false
+        subject_alt_name:
+          - "DNS:tang.example.com"
+          - "DNS:*.tang.example.com"
+          - "DNS:localhost"
+      register: tang_csr
+      tags:
+        - setup
+
+    - name: Create self-signed Cert from webservice
+      community.crypto.x509_certificate:
+        path: /etc/mtls/certificates/tang.crt
+        csr_content: "{{ tang_csr.csr }}"
+        privatekey_path: /etc/mtls/private/tang.key
+        #privatekey_passphrase: "{{ random_passphrase }}"  # enable me if you want a protected Service SSL
+        provider: ownca
+        ownca_path: /etc/mtls/ca.crt
+        ownca_privatekey_path: /etc/mtls/private/ca.key
+        ownca_privatekey_passphrase: "{{ secret_ca_passphrase }}"
+        ownca_not_after: +365d
+        ownca_not_before: "-1d"
+      tags:
+        - setup
+
+    - name: password handling for client key
+      # set to never as we move to passphrase less keys for clients 
+      block:
+      - name: fetch Vault password for Client
+        vars:
+          token: "{{ lookup('ansible.builtin.env', 'VAULT_TOKEN') |
+                    default ( lookup('ansible.builtin.vars', 'VAULT_TOKEN'), True) }}"
+          vault_addr: "{{ lookup('ansible.builtin.env', 'VAULT_ADDR') |
+                    default ( lookup('ansible.builtin.vars', 'VAULT_ADDR'), True) }}"
+          password: "{{ lookup('community.hashi_vault.hashi_vault',
+                          'secret=kv/data/tang/mtls/{{client}}:password
+                          token={{ token }}
+                          url={{ vault_addr }}') }}"
+        ansible.builtin.set_fact:
+          random_passphrase: "{{ password }}"
+        delegate_to: localhost
+        tags:
+          - never
+
+      rescue:
+      - name: generate random password for Client
+        ansible.builtin.set_fact:
+          random_passphrase: "{{ lookup('ansible.builtin.password', '/tmp/' + client, length=16) }}"
+        tags:
+          - never
+
+      - name: save client key password to Vault
+        vars:
+          token: "{{ lookup('ansible.builtin.env', 'VAULT_TOKEN') |
+                    default ( lookup('ansible.builtin.vars', 'VAULT_TOKEN'), True) }}"
+          vault_addr: "{{ lookup('ansible.builtin.env', 'VAULT_ADDR') |
+                    default ( lookup('ansible.builtin.vars', 'VAULT_ADDR'), True) }}"
+        community.hashi_vault.vault_kv2_write:
+          url: "{{ vault_addr }}"
+          token: "{{ token }}"
+          engine_mount_point: "kv"
+          path: "/tang/mtls/{{client}}"
+          data:
+            password: "{{ random_passphrase }}"
+        delegate_to: localhost
+        tags:
+          - never
+
+    - name: remove possible existing key and cert 
+      ansible.builtin.file:
+        path: "/etc/mtls/{{ item }}"
+        state: absent
+      with_items:
+        - "certificates/{{ client }}.crt"
+        - "private//{{ client }}.key"
+      notify: Reload stunnel
+      tags:
+        - client 
+
+    - name: Create private key for mTLS client
+      community.crypto.openssl_privatekey:
+        path: "/etc/mtls/private/{{ client }}.key"
+        passphrase: Null 
+        cipher: auto
+      tags:
+        - client
+
+    - name: Create mTLS client request
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "/etc/mtls/private/{{ client }}.key"
+        privatekey_passphrase: Null
+        common_name: "TANG mTLS Client {{ client }}"
+      register: client_csr
+      tags:
+        - client
+
+    - name: Create mTLS client certificate
+      community.crypto.x509_certificate:
+        path: "/etc/mtls/certificates/{{ client }}.crt"
+        csr_content: "{{ client_csr.csr }}"
+        privatekey_path: "/etc/mtls/private/{{ client }}.key"
+        privatekey_passphrase: Null
+        provider: ownca
+        ownca_path: /etc/mtls/ca.crt
+        ownca_privatekey_path: /etc/mtls/private/ca.key
+        ownca_privatekey_passphrase: "{{ secret_ca_passphrase }}"
+        ownca_not_after: +1h
+        ownca_not_before: "-1m"
+      tags:
+        - client
+
+    - name: create stunnel configuration
+      ansible.builtin.template:
+        src: "./stunnel.conf.jn2"
+        dest: "/etc/stunnel/tang.conf"
+      notify: Reload stunnel
+      tags:
+        - client
+
+    - name: ensure stunnel cert names configured
+      lineinfile:
+        dest: /etc/hosts
+        regexp: '{{ item }}$'
+        line: '{{item}}'
+        state: present
+      with_items:
+        - "127.0.0.2 protected.tang.example.com"
+        - "127.0.0.3 tang.example.com"
+      tags:
+        - client
+
+
+    - name: start tang and httpd
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      with_items:
+        - httpd.service
+        - tangd.socket
+      tags:
+        - always
+
+  handlers:
+    - name: Reload stunnel
+      ansible.builtin.service:
+        name: "stunnel@tang"
+        state: restarted
+      run_once: true
+      tags:
+        - client
+
+    - name: Update ca-trust-bundle
+      ansible.builtin.command:
+        cmd: "update-ca-trust"
+      run_once: true
+      tags:
+        - setup
